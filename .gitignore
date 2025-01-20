@@ -3,3 +3,17 @@ leetcode.apkg
 .mypy_cache
 .cookies.sh
 __pycache__
+.idea/
+
+
+# virtual environments
+venv/
+*.env
+
+# python cache
+__pycache__/
+*.py[cod]
+
+# editor/ide files
+.vscode/
+.idea/

@@ -1,16 +1,12 @@
-#!/usr/bin/env python3
-"""
-This script generates an Anki deck with all the leetcode problems currently
-known.
-"""
+# generate.py
 
 import argparse
 import asyncio
 import logging
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Coroutine, List
+from typing import Awaitable, List
+import html
 
-# https://github.com/kerrickstaley/genanki
 import genanki  # type: ignore
 from tqdm import tqdm  # type: ignore
 
@@ -19,7 +15,6 @@ import leetcode_anki.helpers.leetcode
 LEETCODE_ANKI_MODEL_ID = 4567610856
 LEETCODE_ANKI_DECK_ID = 8589798175
 OUTPUT_FILE = "leetcode.apkg"
-ALLOWED_EXTENSIONS = {".py", ".go"}
 
 
 logging.getLogger().setLevel(logging.INFO)
@@ -30,42 +25,32 @@ def parse_args() -> argparse.Namespace:
     Parse command line arguments for the script
     """
     parser = argparse.ArgumentParser(description="Generate Anki cards for leetcode")
+    parser.add_argument("--start", type=int, default=0)
+    parser.add_argument("--stop", type=int, default=2**64)
+    parser.add_argument("--page-size", type=int, default=500)
+    parser.add_argument("--list-id", type=str, default="")
+    parser.add_argument("--output-file", type=str, default=OUTPUT_FILE)
+    # set the default to 'AC' so we only retrieve problems you've actually solved
     parser.add_argument(
-        "--start", type=int, help="Start generation from this problem", default=0
-    )
-    parser.add_argument(
-        "--stop", type=int, help="Stop generation on this problem", default=2**64
-    )
-    parser.add_argument(
-        "--page-size",
-        type=int,
-        help="Get at most this many problems (decrease if leetcode API times out)",
-        default=500,
-    )
-    parser.add_argument(
-        "--list-id",
+        "--problem-status",
         type=str,
-        help="Get all questions from a specific list id (https://leetcode.com/list?selectedList=<list_id>",
-        default="",
+        default="AC",
+        help="Set to 'AC' to only include problems you have accepted solutions for."
     )
     parser.add_argument(
-        "--output-file", type=str, help="Output filename", default=OUTPUT_FILE
+        "--include-last-submission",
+        type=bool,
+        default=True,
+        help="Fetch your last accepted submission. (heavy operation)"
     )
 
     args = parser.parse_args()
-
     return args
 
 
 class LeetcodeNote(genanki.Note):
-    """
-    Extended base class for the Anki note, that correctly sets the unique
-    identifier of the note.
-    """
-
     @property
     def guid(self) -> str:
-        # Hash by leetcode task handle
         return genanki.guid_for(self.fields[0])
 
 
@@ -77,6 +62,11 @@ async def generate_anki_note(
     """
     Generate a single Anki flashcard
     """
+    last_code = await leetcode_data.last_submission_code(leetcode_task_handle)
+    # skip if there's no accepted code at all
+    if not last_code or "No code found" in last_code:
+        return None
+
     return LeetcodeNote(
         model=leetcode_model,
         fields=[
@@ -99,15 +89,21 @@ async def generate_anki_note(
                 )
             ),
             str(await leetcode_data.freq_bar(leetcode_task_handle)),
+            "\n" + html.escape(last_code),
         ],
         tags=await leetcode_data.tags(leetcode_task_handle),
-        # FIXME: sort field doesn't work doesn't work
         sort_field=str(await leetcode_data.freq_bar(leetcode_task_handle)).zfill(3),
     )
 
 
 async def generate(
-    start: int, stop: int, page_size: int, list_id: str, output_file: str
+    start: int,
+    stop: int,
+    page_size: int,
+    list_id: str,
+    output_file: str,
+    problem_status: str,
+    include_last_submission: bool,
 ) -> None:
     """
     Generate an Anki deck
@@ -129,7 +125,7 @@ async def generate(
             {"name": "SubmissionsAccepted"},
             {"name": "SumissionAcceptRate"},
             {"name": "Frequency"},
-            # TODO: add hints
+            {"name": "LastSubmissionCode"},
         ],
         templates=[
             {
@@ -168,7 +164,16 @@ async def generate(
                 <a href='https://leetcode.com/problems/{{Slug}}/solution/'>
                     https://leetcode.com/problems/{{Slug}}/solution/
                 </a>
-                <br/>
+                {{#LastSubmissionCode}}
+                    <br/>
+                    <b>Accepted Last Submission:</b>
+                    <pre>
+                    <code>
+                    {{LastSubmissionCode}}
+                    </code>
+                    </pre>
+                    <br/>
+                {{/LastSubmissionCode}}
                 """,
             }
         ],
@@ -176,41 +181,44 @@ async def generate(
     leetcode_deck = genanki.Deck(LEETCODE_ANKI_DECK_ID, Path(output_file).stem)
 
     leetcode_data = leetcode_anki.helpers.leetcode.LeetcodeData(
-        start, stop, page_size, list_id
+        start,
+        stop,
+        page_size,
+        list_id,
+        problem_status,
+        include_last_submission,
     )
 
     note_generators: List[Awaitable[LeetcodeNote]] = []
-
     task_handles = await leetcode_data.all_problems_handles()
 
-    logging.info("Generating flashcards")
-    for leetcode_task_handle in task_handles:
+    logging.info("Generating flashcards (only for AC submissions).")
+    for handle in tqdm(task_handles, unit="flashcard"):
         note_generators.append(
-            generate_anki_note(leetcode_data, leetcode_model, leetcode_task_handle)
+            generate_anki_note(leetcode_data, leetcode_model, handle)
         )
 
-    for leetcode_note in tqdm(note_generators, unit="flashcard"):
-        leetcode_deck.add_note(await leetcode_note)
+    for note_coro in note_generators:
+        note = await note_coro
+        if note is not None:
+            leetcode_deck.add_note(note)
 
     genanki.Package(leetcode_deck).write_to_file(output_file)
 
 
 async def main() -> None:
-    """
-    The main script logic
-    """
     args = parse_args()
-
-    start, stop, page_size, list_id, output_file = (
+    await generate(
         args.start,
         args.stop,
         args.page_size,
         args.list_id,
         args.output_file,
+        args.problem_status,
+        args.include_last_submission,
     )
-    await generate(start, stop, page_size, list_id, output_file)
 
 
 if __name__ == "__main__":
-    loop: asyncio.events.AbstractEventLoop = asyncio.get_event_loop()
+    loop = asyncio.get_event_loop()
     loop.run_until_complete(main())
